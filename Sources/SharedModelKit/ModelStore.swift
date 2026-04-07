@@ -3,23 +3,21 @@ import CryptoKit
 
 /// The central interface for discovering, downloading, and accessing shared AI models.
 ///
-/// `ModelStore` searches across one or more storage backends to find model files,
-/// handles downloading for both single-file (GGUF) and directory-based (MLX) formats,
-/// and avoids redundant downloads when multiple apps need the same model.
+/// Models are organized on disk by format type, each in its own enclosing folder
+/// with a `model_metadata.json` file recording the download date:
 ///
-/// ## Quick Start
-/// ```swift
-/// let bookmark = BookmarkBackend()
-/// let store = ModelStore(backends: [bookmark])
-/// await store.register(ModelCatalog.all)
-///
-/// // Check if a model is already available
-/// let status = await store.status(of: ModelCatalog.llama3_2_3B_Q4)
-///
-/// // Get the file — downloads if missing, returns instantly if present
-/// let url = try await store.modelURL(for: ModelCatalog.llama3_2_3B_Q4) { received, total in
-///     print("Progress: \(received)/\(total ?? 0)")
-/// }
+/// ```
+/// <shared_folder>/
+/// ├── gguf/
+/// │   └── Llama-3.2-3B-Instruct-Q4_K_M/
+/// │       ├── Llama-3.2-3B-Instruct-Q4_K_M.gguf
+/// │       └── model_metadata.json
+/// ├── mlx/
+/// │   └── Llama-3.2-3B-Instruct-4bit/
+/// │       ├── config.json
+/// │       ├── tokenizer.json
+/// │       ├── *.safetensors
+/// │       └── model_metadata.json
 /// ```
 public actor ModelStore {
     
@@ -48,23 +46,40 @@ public actor ModelStore {
         registry[id]
     }
     
+    // MARK: - Path Resolution
+    
+    /// Returns the expected path for a model's enclosing directory:
+    ///   `<backend_root>/<format.typeDirectory>/<model.filename>/`
+    private func modelDirectory(for model: ModelDescriptor, in root: URL) -> URL {
+        root
+            .appendingPathComponent(model.format.typeDirectory, isDirectory: true)
+            .appendingPathComponent(model.filename, isDirectory: true)
+    }
+    
+    /// Returns the URL that should be passed to an inference engine:
+    /// - GGUF: the `.gguf` file inside the model directory
+    /// - MLX: the model directory itself (contains config.json + safetensors)
+    private func inferenceURL(for model: ModelDescriptor, in modelDir: URL) -> URL {
+        if model.format.isDirectory {
+            return modelDir
+        } else {
+            return modelDir.appendingPathComponent(model.weightsFilename)
+        }
+    }
+    
     // MARK: - Status
     
     /// Check the current status of a model across all backends.
     public func status(of model: ModelDescriptor) -> ModelStatus {
-        // Check if any backend is available
         let hasBackend = backends.contains { (try? $0.rootDirectory()) != nil }
         guard hasBackend else { return .unavailable }
         
-        // Check if currently downloading
         if activeDownloads[model.id] != nil {
             return .downloading(progress: 0, receivedBytes: 0, totalBytes: model.expectedSizeBytes)
         }
         
-        // Check if present on disk
         if let located = locate(model) {
-            let size = located.fileSize
-            return .ready(url: located.fileURL, sizeBytes: size)
+            return .ready(url: located.fileURL, sizeBytes: located.fileSize)
         }
         
         return .notDownloaded
@@ -78,58 +93,97 @@ public actor ModelStore {
     // MARK: - Discovery
     
     /// Search all backends for a model. Returns the first match.
-    /// Works for both single files (GGUF) and directories (MLX).
     public func locate(_ model: ModelDescriptor) -> LocatedModel? {
         for backend in backends {
             guard let root = try? backend.rootDirectory() else { continue }
-            let fileURL = root.appendingPathComponent(model.filename)
+            let modelDir = modelDirectory(for: model, in: root)
+            let engineURL = inferenceURL(for: model, in: modelDir)
             
+            let exists: Bool
             if model.format.isDirectory {
-                // For directory-based formats, check the directory contains config.json
-                if Self.isMLXModelDirectory(fileURL) {
-                    return LocatedModel(descriptor: model, fileURL: fileURL, backend: backend)
-                }
+                exists = Self.isMLXModelDirectory(engineURL)
             } else {
-                if FileManager.default.fileExists(atPath: fileURL.path) {
-                    return LocatedModel(descriptor: model, fileURL: fileURL, backend: backend)
-                }
+                exists = FileManager.default.fileExists(atPath: engineURL.path)
+            }
+            
+            if exists {
+                let metadata = ModelDownloadMetadata.read(from: modelDir)
+                return LocatedModel(
+                    descriptor: model,
+                    fileURL: engineURL,
+                    modelDirectory: modelDir,
+                    backend: backend,
+                    downloadMetadata: metadata
+                )
             }
         }
         return nil
     }
     
-    /// List all models found across all backends.
+    /// Discover all models across all backends by scanning type directories.
     public func discoveredModels() -> [LocatedModel] {
         var results: [LocatedModel] = []
-        let knownFilenames = Dictionary(uniqueKeysWithValues: registry.values.map { ($0.filename, $0) })
+        let knownFilenames = Dictionary(
+            uniqueKeysWithValues: registry.values.map { ($0.filename, $0) }
+        )
         
         for backend in backends {
             guard let root = try? backend.rootDirectory() else { continue }
-            guard let contents = try? FileManager.default.contentsOfDirectory(
-                at: root,
-                includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            ) else { continue }
             
-            for url in contents {
-                let filename = url.lastPathComponent
-                if let desc = knownFilenames[filename] {
-                    results.append(LocatedModel(descriptor: desc, fileURL: url, backend: backend))
-                } else if ModelFormat.allKnownExtensions.contains(url.pathExtension.lowercased()) {
-                    let generic = ModelDescriptor(
-                        id: filename, name: filename,
-                        family: "unknown", parameterCount: "unknown", quantization: "unknown",
-                        format: ModelFormat(rawValue: url.pathExtension.lowercased()) ?? .bin,
-                        filename: filename
-                    )
-                    results.append(LocatedModel(descriptor: generic, fileURL: url, backend: backend))
-                } else if Self.isMLXModelDirectory(url) {
-                    let generic = ModelDescriptor(
-                        id: filename, name: filename,
-                        family: "unknown", parameterCount: "unknown", quantization: "unknown",
-                        format: .mlx, filename: filename
-                    )
-                    results.append(LocatedModel(descriptor: generic, fileURL: url, backend: backend))
+            // Scan each type directory (gguf/, mlx/, etc.)
+            for format in [ModelFormat.gguf, .mlx, .coreml, .safetensors, .bin] {
+                let typeDir = root.appendingPathComponent(format.typeDirectory, isDirectory: true)
+                guard let modelDirs = try? FileManager.default.contentsOfDirectory(
+                    at: typeDir,
+                    includingPropertiesForKeys: [.isDirectoryKey],
+                    options: [.skipsHiddenFiles]
+                ) else { continue }
+                
+                for modelDir in modelDirs {
+                    var isDir: ObjCBool = false
+                    guard FileManager.default.fileExists(atPath: modelDir.path, isDirectory: &isDir),
+                          isDir.boolValue else { continue }
+                    
+                    let folderName = modelDir.lastPathComponent
+                    let metadata = ModelDownloadMetadata.read(from: modelDir)
+                    
+                    // Try to match against the registry
+                    if let desc = knownFilenames[folderName] {
+                        let engineURL = inferenceURL(for: desc, in: modelDir)
+                        results.append(LocatedModel(
+                            descriptor: desc,
+                            fileURL: engineURL,
+                            modelDirectory: modelDir,
+                            backend: backend,
+                            downloadMetadata: metadata
+                        ))
+                    } else if let desc = metadata?.descriptor {
+                        // Use the descriptor stored in the metadata
+                        let engineURL = inferenceURL(for: desc, in: modelDir)
+                        results.append(LocatedModel(
+                            descriptor: desc,
+                            fileURL: engineURL,
+                            modelDirectory: modelDir,
+                            backend: backend,
+                            downloadMetadata: metadata
+                        ))
+                    } else {
+                        // Unknown model — create a generic descriptor
+                        let generic = ModelDescriptor(
+                            id: folderName, name: folderName,
+                            family: "unknown", parameterCount: "unknown",
+                            quantization: "unknown", format: format,
+                            filename: folderName
+                        )
+                        let engineURL = inferenceURL(for: generic, in: modelDir)
+                        results.append(LocatedModel(
+                            descriptor: generic,
+                            fileURL: engineURL,
+                            modelDirectory: modelDir,
+                            backend: backend,
+                            downloadMetadata: metadata
+                        ))
+                    }
                 }
             }
         }
@@ -147,8 +201,11 @@ public actor ModelStore {
     
     // MARK: - Access
     
-    /// Get a local URL for a model. Downloads if missing.
-    /// Handles both GGUF (single-file download) and MLX (multi-file HuggingFace repo download).
+    /// Get an inference-ready URL for a model. Downloads if missing.
+    ///
+    /// Returns:
+    /// - GGUF: path to the `.gguf` file
+    /// - MLX: path to the model directory
     public func modelURL(
         for model: ModelDescriptor,
         downloadIfMissing: Bool = true,
@@ -162,7 +219,6 @@ public actor ModelStore {
             throw SharedModelKitError.modelNotFound(model.id)
         }
         
-        // Coalesce concurrent requests
         if let existing = activeDownloads[model.id] {
             return try await existing.value
         }
@@ -186,26 +242,28 @@ public actor ModelStore {
         }
     }
     
+    /// Read the download metadata for a model.
+    public func metadata(for model: ModelDescriptor) -> ModelDownloadMetadata? {
+        locate(model)?.downloadMetadata
+    }
+    
     /// Delete a model from all backends.
     public func delete(_ model: ModelDescriptor) throws {
         var deleted = false
         for backend in backends {
             guard let root = try? backend.rootDirectory() else { continue }
-            let fileURL = root.appendingPathComponent(model.filename)
-            if FileManager.default.fileExists(atPath: fileURL.path) {
-                try FileManager.default.removeItem(at: fileURL)
+            let modelDir = modelDirectory(for: model, in: root)
+            if FileManager.default.fileExists(atPath: modelDir.path) {
+                try FileManager.default.removeItem(at: modelDir)
                 deleted = true
             }
-            // Also remove sidecar manifest if present
-            let manifestURL = fileURL.appendingPathExtension("json")
-            try? FileManager.default.removeItem(at: manifestURL)
         }
         if !deleted {
             throw SharedModelKitError.modelNotFound(model.id)
         }
     }
     
-    // MARK: - Single-File Download (GGUF, safetensors, etc.)
+    // MARK: - Single-File Download (GGUF, etc.)
     
     private func downloadSingleFile(
         _ model: ModelDescriptor,
@@ -219,14 +277,23 @@ public actor ModelStore {
             throw SharedModelKitError.backendUnavailable("No writable backend available.")
         }
         
-        let destinationURL = root.appendingPathComponent(model.filename)
-        let tempURL = destinationURL.appendingPathExtension("download")
+        let modelDir = modelDirectory(for: model, in: root)
+        let tempDir = modelDir.deletingLastPathComponent()
+            .appendingPathComponent(model.filename + ".downloading", isDirectory: true)
+        
+        // Clean up partial downloads
+        if FileManager.default.fileExists(atPath: tempDir.path) {
+            try FileManager.default.removeItem(at: tempDir)
+        }
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        
+        let weightsFile = tempDir.appendingPathComponent(model.weightsFilename)
         
         // Stream download
         let (asyncBytes, response) = try await URLSession.shared.bytes(from: remoteURL)
         
-        if let httpResponse = response as? HTTPURLResponse,
-           httpResponse.statusCode >= 400 {
+        if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode >= 400 {
+            try? FileManager.default.removeItem(at: tempDir)
             throw SharedModelKitError.httpError(statusCode: httpResponse.statusCode)
         }
         
@@ -234,8 +301,8 @@ public actor ModelStore {
             .flatMap { Int64($0.value(forHTTPHeaderField: "Content-Length") ?? "") }
             ?? model.expectedSizeBytes
         
-        FileManager.default.createFile(atPath: tempURL.path, contents: nil)
-        let handle = try FileHandle(forWritingTo: tempURL)
+        FileManager.default.createFile(atPath: weightsFile.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: weightsFile)
         defer { try? handle.close() }
         
         var received: Int64 = 0
@@ -252,41 +319,46 @@ public actor ModelStore {
                 buffer.removeAll(keepingCapacity: true)
             }
         }
-        
         if !buffer.isEmpty {
             try handle.write(contentsOf: buffer)
             received += Int64(buffer.count)
             progress?(received, totalBytes)
         }
-        
         try handle.close()
         
         // Verify integrity
+        var verifiedHash: String? = nil
         if let expectedHash = model.sha256 {
-            let actualHash = try sha256(of: tempURL)
+            let actualHash = try sha256(of: weightsFile)
             guard actualHash == expectedHash.lowercased() else {
-                try? FileManager.default.removeItem(at: tempURL)
+                try? FileManager.default.removeItem(at: tempDir)
                 throw SharedModelKitError.integrityCheckFailed(expected: expectedHash, actual: actualHash)
             }
+            verifiedHash = actualHash
         }
         
-        // Move to final location
-        if FileManager.default.fileExists(atPath: destinationURL.path) {
-            try FileManager.default.removeItem(at: destinationURL)
+        // Write metadata
+        let meta = ModelDownloadMetadata(
+            descriptor: model,
+            downloadedAt: Date(),
+            sizeOnDiskBytes: received,
+            verifiedSHA256: verifiedHash
+        )
+        try meta.write(to: tempDir)
+        
+        // Atomic move to final location
+        let typeDir = modelDir.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: typeDir, withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: modelDir.path) {
+            try FileManager.default.removeItem(at: modelDir)
         }
-        try FileManager.default.moveItem(at: tempURL, to: destinationURL)
+        try FileManager.default.moveItem(at: tempDir, to: modelDir)
         
-        // Sidecar manifest
-        let manifestData = try JSONEncoder().encode(model)
-        try manifestData.write(to: destinationURL.appendingPathExtension("json"))
-        
-        return destinationURL
+        return inferenceURL(for: model, in: modelDir)
     }
     
-    // MARK: - MLX Directory Download (HuggingFace repo)
+    // MARK: - MLX Directory Download
     
-    /// Downloads an MLX model from HuggingFace by fetching the file listing
-    /// via the HF API, then downloading each file into a local directory.
     private func downloadMLXModel(
         _ model: ModelDescriptor,
         progress: (@Sendable (Int64, Int64?) -> Void)?
@@ -299,51 +371,45 @@ public actor ModelStore {
             throw SharedModelKitError.backendUnavailable("No writable backend available.")
         }
         
-        let destinationDir = root.appendingPathComponent(model.filename, isDirectory: true)
-        let tempDir = root.appendingPathComponent(model.filename + ".downloading", isDirectory: true)
+        let modelDir = modelDirectory(for: model, in: root)
+        let tempDir = modelDir.deletingLastPathComponent()
+            .appendingPathComponent(model.filename + ".downloading", isDirectory: true)
         
-        // Clean up any previous partial download
         if FileManager.default.fileExists(atPath: tempDir.path) {
             try FileManager.default.removeItem(at: tempDir)
         }
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         
-        // 1. Fetch file listing from HuggingFace API
+        // Fetch file listing from HuggingFace API
         let apiURL = URL(string: "https://huggingface.co/api/models/\(mlxModelID)")!
         let (apiData, apiResponse) = try await URLSession.shared.data(from: apiURL)
         
         if let httpResponse = apiResponse as? HTTPURLResponse, httpResponse.statusCode >= 400 {
+            try? FileManager.default.removeItem(at: tempDir)
             throw SharedModelKitError.httpError(statusCode: httpResponse.statusCode)
         }
         
         let repoInfo = try JSONDecoder().decode(HFRepoInfo.self, from: apiData)
         
-        // Filter to model-relevant files
         let modelFiles = repoInfo.siblings.filter { sibling in
             let name = sibling.rfilename
-            // Include essential model files, skip READMEs/licenses/etc.
             return name.hasSuffix(".safetensors")
                 || name.hasSuffix(".json")
-                || name.hasSuffix(".txt")      // tokenizer vocab files
-                || name.hasSuffix(".model")    // sentencepiece
-                || name.hasSuffix(".tiktoken") // tiktoken vocab
+                || name.hasSuffix(".txt")
+                || name.hasSuffix(".model")
+                || name.hasSuffix(".tiktoken")
         }
         
         guard !modelFiles.isEmpty else {
-            throw SharedModelKitError.mlxMetadataError(
-                "No model files found in repo \(mlxModelID)"
-            )
+            try? FileManager.default.removeItem(at: tempDir)
+            throw SharedModelKitError.mlxMetadataError("No model files found in repo \(mlxModelID)")
         }
         
-        // 2. Calculate total size for progress
         let totalBytes: Int64 = modelFiles.reduce(0) { $0 + ($1.size ?? 0) }
         var cumulativeReceived: Int64 = 0
         
-        // 3. Download each file
         for fileInfo in modelFiles {
             let filename = fileInfo.rfilename
-            
-            // Create subdirectories if needed (e.g. "model-00001-of-00002.safetensors")
             let fileDestination = tempDir.appendingPathComponent(filename)
             let fileDir = fileDestination.deletingLastPathComponent()
             if !FileManager.default.fileExists(atPath: fileDir.path) {
@@ -351,10 +417,10 @@ public actor ModelStore {
             }
             
             let downloadURL = URL(string: "https://huggingface.co/\(mlxModelID)/resolve/main/\(filename)")!
-            
             let (asyncBytes, response) = try await URLSession.shared.bytes(from: downloadURL)
             
             if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode >= 400 {
+                try? FileManager.default.removeItem(at: tempDir)
                 throw SharedModelKitError.httpError(statusCode: httpResponse.statusCode)
             }
             
@@ -370,31 +436,36 @@ public actor ModelStore {
                 if buffer.count >= bufferSize {
                     try handle.write(contentsOf: buffer)
                     cumulativeReceived += Int64(buffer.count)
-                    progress?(cumulativeReceived, totalBytes > 0 ? totalBytes : nil)
+                    progress?(cumulativeReceived, totalBytes > 0 ? totalBytes : model.expectedSizeBytes)
                     buffer.removeAll(keepingCapacity: true)
                 }
             }
-            
             if !buffer.isEmpty {
                 try handle.write(contentsOf: buffer)
                 cumulativeReceived += Int64(buffer.count)
-                progress?(cumulativeReceived, totalBytes > 0 ? totalBytes : nil)
+                progress?(cumulativeReceived, totalBytes > 0 ? totalBytes : model.expectedSizeBytes)
             }
-            
             try handle.close()
         }
         
-        // 4. Move temp directory to final location
-        if FileManager.default.fileExists(atPath: destinationDir.path) {
-            try FileManager.default.removeItem(at: destinationDir)
+        // Write metadata
+        let meta = ModelDownloadMetadata(
+            descriptor: model,
+            downloadedAt: Date(),
+            sizeOnDiskBytes: cumulativeReceived,
+            verifiedSHA256: nil
+        )
+        try meta.write(to: tempDir)
+        
+        // Atomic move
+        let typeDir = modelDir.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: typeDir, withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: modelDir.path) {
+            try FileManager.default.removeItem(at: modelDir)
         }
-        try FileManager.default.moveItem(at: tempDir, to: destinationDir)
+        try FileManager.default.moveItem(at: tempDir, to: modelDir)
         
-        // Sidecar manifest
-        let manifestData = try JSONEncoder().encode(model)
-        try manifestData.write(to: destinationDir.appendingPathExtension("json"))
-        
-        return destinationDir
+        return inferenceURL(for: model, in: modelDir)
     }
     
     // MARK: - Integrity
@@ -411,7 +482,6 @@ public actor ModelStore {
     private func sha256(of url: URL) throws -> String {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
-        
         var hasher = SHA256()
         while autoreleasepool(invoking: {
             let chunk = handle.readData(ofLength: 4 * 1024 * 1024)
@@ -419,19 +489,16 @@ public actor ModelStore {
             hasher.update(data: chunk)
             return true
         }) {}
-        
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 }
 
 // MARK: - HuggingFace API Models
 
-/// Minimal representation of a HuggingFace model repo API response.
 private struct HFRepoInfo: Decodable {
     let siblings: [HFSibling]
 }
 
-/// A single file entry in a HuggingFace repo.
 private struct HFSibling: Decodable {
     let rfilename: String
     let size: Int64?
@@ -441,11 +508,29 @@ private struct HFSibling: Decodable {
 
 /// A model that has been found on disk.
 public struct LocatedModel: Sendable {
+    /// The descriptor of the model.
     public let descriptor: ModelDescriptor
+    
+    /// The URL to pass to an inference engine.
+    /// - GGUF: path to the `.gguf` file
+    /// - MLX: path to the model directory (containing config.json + safetensors)
     public let fileURL: URL
+    
+    /// The enclosing directory containing the model files and `model_metadata.json`.
+    public let modelDirectory: URL
+    
+    /// The storage backend where this model was found.
     public let backend: ModelStorageBackend
     
-    /// Total size in bytes. For directories, returns the sum of all files.
+    /// The download metadata, if a `model_metadata.json` file is present.
+    public let downloadMetadata: ModelDownloadMetadata?
+    
+    /// When this model was downloaded, if metadata is available.
+    public var downloadedAt: Date? {
+        downloadMetadata?.downloadedAt
+    }
+    
+    /// Total size in bytes. For directories, sums all files.
     public var fileSize: Int64? {
         if descriptor.format.isDirectory {
             return Self.directorySize(fileURL)
@@ -463,17 +548,13 @@ public struct LocatedModel: Sendable {
     
     private static func directorySize(_ url: URL) -> Int64? {
         guard let enumerator = FileManager.default.enumerator(
-            at: url,
-            includingPropertiesForKeys: [.fileSizeKey],
+            at: url, includingPropertiesForKeys: [.fileSizeKey],
             options: [.skipsHiddenFiles]
         ) else { return nil }
-        
         var total: Int64 = 0
         for case let fileURL as URL in enumerator {
             if let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey]),
-               let size = values.fileSize {
-                total += Int64(size)
-            }
+               let size = values.fileSize { total += Int64(size) }
         }
         return total
     }

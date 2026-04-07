@@ -2,41 +2,24 @@ import Foundation
 
 /// Describes an AI model that can be shared across apps.
 public struct ModelDescriptor: Codable, Hashable, Sendable, Identifiable {
-    /// Unique identifier, e.g. "mistral-7b-instruct-v0.3-Q4_K_M"
     public let id: String
-    
-    /// Human-readable name
     public let name: String
-    
-    /// Model family (llama, mistral, gemma, phi, qwen, etc.)
     public let family: String
-    
-    /// Parameter count string, e.g. "7B", "13B"
     public let parameterCount: String
-    
-    /// Quantization format, e.g. "Q4_K_M", "Q8_0", "4-bit"
     public let quantization: String
-    
-    /// File format of the model weights
     public let format: ModelFormat
-    
-    /// Expected total size in bytes (for progress/validation)
     public let expectedSizeBytes: Int64?
-    
-    /// SHA-256 hash of the model file for integrity verification (single-file formats only)
     public let sha256: String?
-    
-    /// Remote URL to download the model from (e.g. Hugging Face direct link for GGUF).
-    /// For directory-based formats like MLX, this is nil — use `mlxModelID` in metadata instead.
     public let remoteURL: URL?
     
-    /// The filename (for single-file formats) or directory name (for MLX) on disk.
+    /// The name of this model's enclosing folder on disk.
+    /// e.g. "Llama-3.2-3B-Instruct-Q4_K_M" or "Llama-3.2-3B-Instruct-4bit"
     public let filename: String
     
     /// Optional metadata. Common keys:
     /// - `"huggingface"`: URL to the HuggingFace model page
     /// - `"license"`: License name
-    /// - `"mlxModelID"`: HuggingFace repo ID for MLX models (e.g. "mlx-community/Llama-3.2-3B-Instruct-4bit")
+    /// - `"mlxModelID"`: HuggingFace repo ID for MLX models
     public let metadata: [String: String]
     
     public init(
@@ -61,7 +44,7 @@ public struct ModelDescriptor: Codable, Hashable, Sendable, Identifiable {
         self.expectedSizeBytes = expectedSizeBytes
         self.sha256 = sha256
         self.remoteURL = remoteURL
-        self.filename = filename ?? "\(id).\(format.fileExtension)"
+        self.filename = filename ?? id
         self.metadata = metadata
     }
     
@@ -69,16 +52,21 @@ public struct ModelDescriptor: Codable, Hashable, Sendable, Identifiable {
     public var mlxModelID: String? {
         metadata["mlxModelID"]
     }
+    
+    /// The name of the actual weights file inside the model folder (GGUF only).
+    public var weightsFilename: String {
+        "\(filename).\(format.fileExtension)"
+    }
 }
 
 /// Supported model file formats.
 public enum ModelFormat: String, Codable, Hashable, Sendable {
     case gguf
-    case mlx            // directory containing config.json + tokenizer.json + .safetensors
+    case mlx
     case coreml
     case mlpackage
     case mlmodelc
-    case bin            // raw weights
+    case bin
     case safetensors
     
     public var fileExtension: String {
@@ -93,7 +81,7 @@ public enum ModelFormat: String, Codable, Hashable, Sendable {
         }
     }
     
-    /// Whether this format is stored as a directory rather than a single file.
+    /// Whether this format stores model weights as a directory of files.
     public var isDirectory: Bool {
         switch self {
         case .mlx, .mlpackage, .mlmodelc, .coreml:
@@ -101,5 +89,25 @@ public enum ModelFormat: String, Codable, Hashable, Sendable {
         default:
             return false
         }
+    }
+    
+    /// The top-level folder name used to group models of this type.
+    ///
+    /// On-disk layout:
+    /// ```
+    /// <shared_folder>/
+    /// ├── gguf/
+    /// │   └── Llama-3.2-3B-Instruct-Q4_K_M/
+    /// │       ├── Llama-3.2-3B-Instruct-Q4_K_M.gguf
+    /// │       └── model_metadata.json
+    /// ├── mlx/
+    /// │   └── Llama-3.2-3B-Instruct-4bit/
+    /// │       ├── config.json
+    /// │       ├── tokenizer.json
+    /// │       ├── *.safetensors
+    /// │       └── model_metadata.json
+    /// ```
+    public var typeDirectory: String {
+        rawValue
     }
 }
